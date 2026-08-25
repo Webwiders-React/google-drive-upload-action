@@ -1,0 +1,90 @@
+name: 'Google Drive Upload via Service Account'
+description: 'Uploads a file to Google Drive and optionally sends a Slack notification'
+inputs:
+  credentials_json:
+    description: 'Google Service Account JSON string'
+    required: true
+  folder_id:
+    description: 'The Google Drive folder ID to upload to'
+    required: true
+  file_path:
+    description: 'The local path of the file to upload'
+    required: true
+  slack_webhook_url:
+    description: 'Optional Slack webhook URL for notifications'
+    required: false
+    default: ''
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install dependencies
+      shell: bash
+      run: pip install google-api-python-client google-auth
+
+    - name: Upload to Google Drive (Python Script)
+      shell: bash
+      env:
+        CREDENTIALS_JSON: ${{ inputs.credentials_json }}
+        FOLDER_ID: ${{ inputs.folder_id }}
+        FILE_PATH: ${{ inputs.file_path }}
+      run: |
+        python3 -c "
+        import os, json
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+
+        creds_json = json.loads(os.environ['CREDENTIALS_JSON'])
+        creds = service_account.Credentials.from_service_account_info(creds_json, scopes=['https://www.googleapis.com/auth/drive'])
+        drive_service = build('drive', 'v3', credentials=creds)
+
+        folder_id = os.environ['FOLDER_ID']
+        file_path = os.environ['FILE_PATH']
+        file_name = file_path.split('/')[-1]
+
+        print(f'Uploading {file_name} to folder {folder_id}...')
+
+        query = f\"name='{file_name}' and '{folder_id}' in parents and trashed=false\"
+        results = drive_service.files().list(q=query, fields='files(id, name)').execute()
+        items = results.get('files', [])
+
+        media = MediaFileUpload(file_path, resumable=True)
+
+        if not items:
+            print('Creating new file...')
+            file_metadata = {'name': file_name, 'parents': [folder_id]}
+            file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            file_id = file.get('id')
+        else:
+            print('Updating existing file...')
+            file_id = items[0]['id']
+            file = drive_service.files().update(fileId=file_id, media_body=media, fields='id').execute()
+
+        # Auto-Sharing Permissions
+        print('Setting permissions to Anyone with Link can View...')
+        permission = {'type': 'anyone', 'role': 'reader'}
+        drive_service.permissions().create(fileId=file_id, body=permission).execute()
+
+        # Get the Web View Link
+        file = drive_service.files().get(fileId=file_id, fields='webViewLink').execute()
+        web_view_link = file.get('webViewLink')
+        
+        # Export link to GitHub Actions Environment for the next step
+        with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f'WEB_VIEW_LINK={web_view_link}\n')
+
+        print(f'Successfully uploaded! File ID: {file_id}')
+        print(f'Download Link: {web_view_link}')
+        "
+
+    - name: Send Slack Notification
+      if: inputs.slack_webhook_url != ''
+      shell: bash
+      env:
+        SLACK_WEBHOOK: ${{ inputs.slack_webhook_url }}
+      run: |
+        COMMIT_MSG=$(git log -1 --pretty=format:"%s" || echo "New Build")
+        curl -X POST -H 'Content-type: application/json' --data "{
+          \"text\": \"🚀 *New Build Ready!*\n*Commit:* $COMMIT_MSG\n*Download Link:* ${{ env.WEB_VIEW_LINK }}\"
+        }" $SLACK_WEBHOOK
